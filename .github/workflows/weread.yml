@@ -26,9 +26,11 @@ jobs:
         run: |
           python - <<'PY'
           import os, requests
+          c = os.environ.get("WEREAD_COOKIE","")
+          print("cookie_len:", len(c))
           s = requests.Session()
           s.headers.update({
-            "Cookie": os.environ["WEREAD_COOKIE"],
+            "Cookie": c,
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://weread.qq.com/",
@@ -38,13 +40,15 @@ jobs:
           print("status:", r.status_code)
           print("body_head:", r.text[:120])
           PY
+
       - name: Check cookie keys
         env:
-          COOKIE: ${{ secrets.WEREAD_COOKIE }}
+          WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
         run: |
           python - <<'PY'
           import os, re
-          c=os.environ["COOKIE"]
+          c=os.environ.get("WEREAD_COOKIE","")
+          print("cookie_len:", len(c))
           for k in ["wr_skey","wr_vid","wxsid","wxuin","skey","uin"]:
             print(k, "OK" if re.search(rf"(?:^|;\\s*){re.escape(k)}=", c) else "MISSING")
           PY
