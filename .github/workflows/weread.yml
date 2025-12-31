@@ -20,6 +20,34 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Probe WeRead auth (notebooks)
+        env:
+          WEREAD_COOKIE: ${{ secrets.WEREAD_C00KIE }}
+        run: |
+          python - <<'PY'
+          import os, requests
+          s = requests.Session()
+          s.headers.update({
+            "Cookie": os.environ["WEREAD_COOKIE"],
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://weread.qq.com/",
+            "Origin": "https://weread.qq.com",
+          })
+          r = s.get("https://i.weread.qq.com/user/notebooks", timeout=30)
+          print("status:", r.status_code)
+          print("body_head:", r.text[:120])
+          PY
+      - name: Check cookie keys
+        env:
+          COOKIE: ${{ secrets.WEREAD_C00KIE }}
+        run: |
+          python - <<'PY'
+          import os, re
+          c=os.environ["COOKIE"]
+          for k in ["wr_skey","wr_vid","wxsid","wxuin","skey","uin"]:
+            print(k, "OK" if re.search(rf"(?:^|;\\s*){re.escape(k)}=", c) else "MISSING")
+          PY
       - name: weread sync
         env:
           WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
