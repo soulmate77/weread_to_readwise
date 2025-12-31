@@ -41,17 +41,23 @@ jobs:
           print("body_head:", r.text[:120])
           PY
 
-      - name: Check cookie keys
+      - name: Check cookie keys (safe)
         env:
           WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
         run: |
           python - <<'PY'
-          import os, re
-          c=os.environ.get("WEREAD_COOKIE","")
+          import os, re, hashlib
+          c = os.environ.get("WEREAD_COOKIE","")
           print("cookie_len:", len(c))
-          for k in ["wr_skey","wr_vid","wxsid","wxuin","skey","uin"]:
-            print(k, "OK" if re.search(rf"(?:^|;\\s*){re.escape(k)}=", c) else "MISSING")
+          # Safe fingerprints (won't reveal cookie)
+          print("sha256:", hashlib.sha256(c.encode()).hexdigest()[:16])
+          # Presence checks
+          for k in ["wr_skey=", "wr_vid=", "wr_rt=", "_qimei_fingerprint=", "qq_domain_video_guid_verify="]:
+            print(k, "YES" if k in c else "NO")
+          # Also show how many semicolons (rough completeness indicator)
+          print("semicolon_count:", c.count(";"))
           PY
+
       - name: weread sync
         env:
           WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
