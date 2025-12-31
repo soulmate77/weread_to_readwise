@@ -1,349 +1,434 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Created on Fri May 26 09:19:25 2023
-
-@author: 
-
-helpdoc:
-https://readwise.io/api_deets
-https://github.com/zhaohongxuan/obsidian-weread-plugin/blob/main/docs/weread-api.md
-https://github.com/peixian/zotfile-to-readwise/blob/main/annotations.py
 
 """
+WeRead -> Readwise sync (highlights + notes)
 
-import json
-import logging
-import argparse
+Env:
+  WEREAD_COOKIE    (required) full cookie string from weread.qq.com / i.weread.qq.com
+  READWISE_TOKEN   (required) Readwise access token
+
+Optional:
+  WEREAD_USER_VID  (optional) if not set, will try to parse from cookie (wr_vid)
+  ONLY_RECENT_DAYS (optional) int, if set will only sync highlights/notes newer than N days
+  DRY_RUN          (optional) "1" to print payload count without posting to Readwise
+
+This script:
+- Pulls bookshelf
+- For each book:
+  - Fetches bookmarklist (highlights; includes comment fields for many highlights)
+  - Fetches review/list (note-only "thoughts"/reviews)
+- Converts to Readwise highlight payload with stable external_id
+"""
+
+from __future__ import annotations
+
+import os
 import re
+import json
 import time
-import requests
-from requests.utils import cookiejar_from_dict
-from http.cookies import SimpleCookie
-from datetime import datetime
 import hashlib
-import pytz
+import datetime as dt
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 
-WEREAD_URL = "https://weread.qq.com/"
-WEREAD_NOTEBOOKS_URL = "https://i.weread.qq.com/user/notebooks"
-WEREAD_BOOKMARKLIST_URL = "https://i.weread.qq.com/book/bookmarklist"
-WEREAD_CHAPTER_INFO = "https://i.weread.qq.com/book/chapterInfos"
-WEREAD_READ_INFO_URL = "https://i.weread.qq.com/book/readinfo"
-WEREAD_REVIEW_LIST_URL = "https://i.weread.qq.com/review/list"
-WEREAD_BOOK_INFO = "https://i.weread.qq.com/book/info"
+READWISE_HIGHLIGHTS_API = "https://readwise.io/api/v2/highlights/"
+
+WEREAD_BASE_I = "https://i.weread.qq.com"
+WEREAD_BASE_WEB = "https://weread.qq.com"
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def parse_cookie_string(cookie_string):
-    cookie = SimpleCookie()
-    cookie.load(cookie_string)
-    cookies_dict = {}
-    cookiejar = None
-    for key, morsel in cookie.items():
-        cookies_dict[key] = morsel.value
-        cookiejar = cookiejar_from_dict(
-            cookies_dict, cookiejar=None, overwrite=True
+@dataclass
+class Book:
+    book_id: str
+    title: str
+    author: str
+    cover: Optional[str] = None
+
+
+@dataclass
+class RWHighlight:
+    text: str
+    title: str
+    author: str
+    source_url: str
+    highlighted_at: str  # ISO 8601
+    note: Optional[str]
+    location: Optional[str]
+    location_type: str
+    external_id: str
+    external_source: str = "weread"
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _unix_to_iso(ts: int) -> str:
+    return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clean_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+
+def _sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _parse_cookie_value(cookie: str, key: str) -> Optional[str]:
+    # very tolerant cookie parser
+    m = re.search(rf"(?:^|;\s*){re.escape(key)}=([^;]+)", cookie)
+    return m.group(1) if m else None
+
+
+class WeReadClient:
+    def __init__(self, cookie: str):
+        self.cookie = cookie
+        self.s = requests.Session()
+        self.s.headers.update(
+            {
+                "User-Agent": UA,
+                "Accept": "application/json, text/plain, */*",
+                "Cookie": cookie,
+                "Origin": WEREAD_BASE_WEB,
+                "Referer": WEREAD_BASE_WEB + "/",
+            }
         )
-    return cookiejar
 
-
-def get_bookmark_list(bookId):
-    """获取我的划线"""
-    params = dict(bookId=bookId)
-    r = session.get(WEREAD_BOOKMARKLIST_URL, params=params)
-    if r.ok:
-        updated = r.json().get("updated")
-        updated = sorted(updated, key=lambda x: (
-            x.get("chapterUid", 1), int(x.get("range").split("-")[0])))
-        return r.json()["updated"]
-    return None
-
-
-def get_read_info(bookId):
-    params = dict(bookId=bookId, readingDetail=1,
-                  readingBookIndex=1, finishedDate=1)
-    r = session.get(WEREAD_READ_INFO_URL, params=params)
-    if r.ok:
+    def _get(self, url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        r = self.s.get(url, params=params, timeout=30)
+        r.raise_for_status()
         return r.json()
-    return None
 
+    def bookshelf(self, user_vid: str) -> List[Book]:
+        """
+        Uses: https://i.weread.qq.com/shelf/friendCommon?userVid=...
+        Returns a merged list of books.
+        """
+        data = self._get(f"{WEREAD_BASE_I}/shelf/friendCommon", params={"userVid": user_vid})
+        books_raw = []
+        for k in ("finishReadBooks", "recentBooks", "allBooks"):
+            if isinstance(data.get(k), list):
+                books_raw.extend(data[k])
 
-def get_bookinfo(bookId):
-    """获取书的详情"""
-    params = dict(bookId=bookId)
-    r = session.get(WEREAD_BOOK_INFO, params=params)
-    isbn = ""
-    if r.ok:
-        data = r.json()
-        isbn = data["isbn"]
-        newRating = data["newRating"]/1000
-    return (isbn, newRating)
+        seen = set()
+        out: List[Book] = []
+        for b in books_raw:
+            book_id = str(b.get("bookId", ""))
+            # filter non-book items (e.g., public accounts)
+            if not book_id.isdigit():
+                continue
+            if book_id in seen:
+                continue
+            seen.add(book_id)
 
+            out.append(
+                Book(
+                    book_id=book_id,
+                    title=str(b.get("title") or ""),
+                    author=str(b.get("author") or ""),
+                    cover=b.get("cover"),
+                )
+            )
+        return out
 
-def get_review_list(bookId):
-    """获取笔记"""
-    params = dict(bookId=bookId, listType=11, mine=1, syncKey=0)
-    r = session.get(WEREAD_REVIEW_LIST_URL, params=params)
-    reviews = r.json().get("reviews")
-    summary = list(filter(lambda x: x.get("review").get("type") == 4, reviews))
-    reviews = list(filter(lambda x: x.get("review").get("type") == 1, reviews))
-    reviews = list(map(lambda x: x.get("review"), reviews))
-    reviews = list(map(lambda x: {**x, "note": x.pop("content")}, reviews))
-    reviews = list(map(lambda x: {**x, "markText": x.get("abstract",x.get('note'))}, reviews))    
-    return summary, reviews
+    def bookmarklist(self, book_id: str) -> Dict[str, Any]:
+        """
+        Uses: https://i.weread.qq.com/book/bookmarklist?bookId=...
+        Includes highlights, and often includes the comment/note attached to highlights.
+        """
+        return self._get(f"{WEREAD_BASE_I}/book/bookmarklist", params={"bookId": book_id})
 
-
-def get_table_of_contents():
-    """获取目录"""
-    return {
-        "type": "table_of_contents",
-        "table_of_contents": {
-            "color": "default"
-        }
-    }
-
-
-def get_heading(level, content):
-    if level == 1:
-        heading = "heading_1"
-    elif level == 2:
-        heading = "heading_2"
-    else:
-        heading = "heading_3"
-    return {
-        "type": heading,
-        heading: {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content,
-                }
-            }],
-            "color": "default",
-            "is_toggleable": False
-        }
-    }
-
-
-def get_quote(content):
-    return {
-        "type": "quote",
-        "quote": {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content
-                },
-            }],
-            "color": "default"
-        }
-    }
-
-
-def get_callout(content, style, colorStyle, reviewId):
-    # 根据不同的划线样式设置不同的emoji 直线type=0 背景颜色是1 波浪线是2
-    emoji = "🌟"
-    if style == 0:
-        emoji = "💡"
-    elif style == 1:
-        emoji = "⭐"
-    # 如果reviewId不是空说明是笔记
-    if reviewId != None:
-        emoji = "✍️"
-    color = "default"
-    # 根据划线颜色设置文字的颜色
-    if colorStyle == 1:
-        color = "red"
-    elif colorStyle == 2:
-        color = "purple"
-    elif colorStyle == 3:
-        color = "blue"
-    elif colorStyle == 4:
-        color = "green"
-    elif colorStyle == 5:
-        color = "yellow"
-    return {
-        "type": "callout",
-        "callout": {
-            "rich_text": [{
-                "type": "text",
-                "text": {
-                    "content": content,
-                }
-            }],
-            "icon": {
-                "emoji": emoji
+    def my_reviews(self, book_id: str) -> Dict[str, Any]:
+        """
+        WeRead "thoughts"/reviews (note-only items).
+        Uses commonly documented endpoint:
+        https://i.weread.qq.com/review/list?bookId=...&listType=11&mine=1&synckey=0&listMode=0
+        """
+        return self._get(
+            f"{WEREAD_BASE_I}/review/list",
+            params={
+                "bookId": book_id,
+                "listType": 11,
+                "mine": 1,
+                "synckey": 0,
+                "listMode": 0,
             },
-            "color": color
+        )
+
+
+class ReadwiseClient:
+    def __init__(self, token: str):
+        self.s = requests.Session()
+        self.s.headers.update(
+            {
+                "Authorization": f"Token {token}",
+                "Content-Type": "application/json",
+                "User-Agent": UA,
+            }
+        )
+
+    def post_highlights(self, highlights: List[RWHighlight]) -> Dict[str, Any]:
+        payload = {
+            "highlights": [
+                {
+                    "text": h.text,
+                    "title": h.title,
+                    "author": h.author,
+                    "source_url": h.source_url,
+                    "highlighted_at": h.highlighted_at,
+                    "note": h.note,
+                    "location": h.location,
+                    "location_type": h.location_type,
+                    "external_id": h.external_id,
+                    "external_source": h.external_source,
+                }
+                for h in highlights
+            ]
         }
-    }
+        r = self.s.post(READWISE_HIGHLIGHTS_API, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        return r.json()
 
 
-def get_notebooklist():
-    """获取笔记本列表"""
-    r = session.get(WEREAD_NOTEBOOKS_URL)
-    if r.ok:
-        data = r.json()
-        books = data.get("books")
-        books.sort(key=lambda x: x["sort"])
-        return books
-    else:
-        print(r.text)
-    return None
+def _weread_book_url(book_id: str) -> str:
+    # A reasonable canonical book URL for Readwise "source_url"
+    return f"{WEREAD_BASE_WEB}/web/reader/{book_id}"
 
 
+def _should_include(ts_unix: int, only_recent_days: Optional[int]) -> bool:
+    if not only_recent_days:
+        return True
+    cutoff = int(time.time()) - only_recent_days * 86400
+    return ts_unix >= cutoff
 
-def transform_id(book_id):
-    id_length = len(book_id)
 
-    if re.match("^\d*$", book_id):
-        ary = []
-        for i in range(0, id_length, 9):
-            ary.append(format(int(book_id[i:min(i + 9, id_length)]), 'x'))
-        return '3', ary
+def _extract_highlights_from_bookmarklist(
+    book: Book,
+    data: Dict[str, Any],
+    only_recent_days: Optional[int],
+) -> List[RWHighlight]:
+    chapters = {}
+    for c in data.get("chapters", []) or []:
+        uid = str(c.get("chapterUid", ""))
+        title = str(c.get("title") or "")
+        if uid and title:
+            chapters[uid] = title
 
-    result = ''
-    for i in range(id_length):
-        result += format(ord(book_id[i]), 'x')
-    return '4', [result]
+    updated = data.get("updated", []) or []
+    out: List[RWHighlight] = []
 
-def calculate_book_str_id(book_id):
-    md5 = hashlib.md5()
-    md5.update(book_id.encode('utf-8'))
-    digest = md5.hexdigest()
-    result = digest[0:3]
-    code, transformed_ids = transform_id(book_id)
-    result += code + '2' + digest[-2:]
+    for item in updated:
+        # highlight text candidates (WeRead varies by client/version)
+        highlight_text = (
+            item.get("markText")
+            or item.get("abstract")
+            or item.get("content")
+            or item.get("text")
+            or ""
+        )
+        highlight_text = _clean_text(str(highlight_text))
 
-    for i in range(len(transformed_ids)):
-        hex_length_str = format(len(transformed_ids[i]), 'x')
-        if len(hex_length_str) == 1:
-            hex_length_str = '0' + hex_length_str
+        if not highlight_text:
+            continue
 
-        result += hex_length_str + transformed_ids[i]
+        # comment/note attached to highlight
+        comment = (
+            item.get("review")
+            or item.get("reviewContent")
+            or item.get("note")
+            or item.get("comment")
+            or ""
+        )
+        comment = _clean_text(str(comment))
 
-        if i < len(transformed_ids) - 1:
-            result += 'g'
+        # extra context
+        chapter_uid = str(item.get("chapterUid") or "")
+        chapter_title = chapters.get(chapter_uid)
+        if chapter_title:
+            if comment:
+                comment = f"{comment}\n\n— Chapter: {chapter_title}"
+            else:
+                # If no comment, still store chapter in note (helps navigation in Readwise)
+                comment = f"— Chapter: {chapter_title}"
 
-    if len(result) < 20:
-        result += digest[0:20 - len(result)]
+        # location (range like "123-129")
+        location = item.get("range") or item.get("location") or None
+        if location is not None:
+            location = str(location)
 
-    md5 = hashlib.md5()
-    md5.update(result.encode('utf-8'))
-    result += md5.hexdigest()[0:3]
-    return result
+        # timestamp
+        ts = int(item.get("createTime") or item.get("updated") or 0)
+        if ts <= 0:
+            # fall back to now if missing
+            ts = int(time.time())
 
-def ctime2utc(ctime):
+        if not _should_include(ts, only_recent_days):
+            continue
 
-    # 将 Unix 时间戳转换为 datetime 对象
-    dt_object = datetime.fromtimestamp(ctime)
-    
-    # 设置时区为东八区
-    timezone = pytz.timezone('Asia/Shanghai')
-    dt_object = timezone.localize(dt_object)
-    
-    # 将 datetime 对象转换为 ISO 8601 格式的字符串
-    iso_format = dt_object.isoformat()
-    
-    return iso_format  # 输出：2016-09-28T15:50:12+08:00
+        # stable external_id
+        # prefer explicit bookmarkId; else hash a few stable fields
+        bookmark_id = item.get("bookmarkId") or item.get("id") or ""
+        if bookmark_id:
+            external_id = f"weread:{book.book_id}:bm:{bookmark_id}"
+        else:
+            key = f"{book.book_id}|{location or ''}|{highlight_text}"
+            external_id = f"weread:{book.book_id}:h:{_sha1(key)}"
 
-#%%远程版本
+        out.append(
+            RWHighlight(
+                text=highlight_text,
+                title=book.title,
+                author=book.author,
+                source_url=_weread_book_url(book.book_id),
+                highlighted_at=_unix_to_iso(ts),
+                note=comment or None,
+                location=location,
+                location_type="weread",
+                external_id=external_id,
+            )
+        )
+
+    return out
+
+
+def _extract_note_only_reviews(
+    book: Book,
+    data: Dict[str, Any],
+    only_recent_days: Optional[int],
+) -> List[RWHighlight]:
+    """
+    Export WeRead 'thoughts' (review/list mine=1 listType=11) as standalone highlights,
+    so they don't get lost. This also helps with the "note export is broken" issue in some exporters.
+    """
+    reviews = []
+    # structure varies; try a few
+    for k in ("reviews", "updated", "data", "items"):
+        v = data.get(k)
+        if isinstance(v, list):
+            reviews = v
+            break
+
+    out: List[RWHighlight] = []
+    for r in reviews:
+        content = r.get("content") or r.get("review") or r.get("text") or ""
+        content = _clean_text(str(content))
+        if not content:
+            continue
+
+        ts = int(r.get("createTime") or r.get("ctime") or 0)
+        if ts <= 0:
+            ts = int(time.time())
+
+        if not _should_include(ts, only_recent_days):
+            continue
+
+        review_id = r.get("reviewId") or r.get("id") or ""
+        if review_id:
+            external_id = f"weread:{book.book_id}:rv:{review_id}"
+        else:
+            key = f"{book.book_id}|review|{content}"
+            external_id = f"weread:{book.book_id}:rvh:{_sha1(key)}"
+
+        # Put the thought itself as highlight text (searchable in Readwise)
+        # and also keep a small label in note.
+        note = "WeRead note (review/thought)."
+
+        out.append(
+            RWHighlight(
+                text=content,
+                title=book.title,
+                author=book.author,
+                source_url=_weread_book_url(book.book_id),
+                highlighted_at=_unix_to_iso(ts),
+                note=note,
+                location=None,
+                location_type="weread",
+                external_id=external_id,
+            )
+        )
+    return out
+
+
+def main() -> None:
+    weread_cookie = os.environ.get("WEREAD_COOKIE", "").strip()
+    readwise_token = os.environ.get("READWISE_TOKEN", "").strip()
+
+    if not weread_cookie:
+        raise SystemExit("Missing env WEREAD_COOKIE")
+    if not readwise_token:
+        raise SystemExit("Missing env READWISE_TOKEN")
+
+    user_vid = os.environ.get("WEREAD_USER_VID", "").strip()
+    if not user_vid:
+        user_vid = _parse_cookie_value(weread_cookie, "wr_vid") or ""
+
+    if not user_vid:
+        raise SystemExit(
+            "Could not determine userVid. Set env WEREAD_USER_VID explicitly, "
+            "or ensure cookie contains wr_vid."
+        )
+
+    only_recent_days = os.environ.get("ONLY_RECENT_DAYS", "").strip()
+    only_recent_days_int: Optional[int] = int(only_recent_days) if only_recent_days else None
+
+    dry_run = os.environ.get("DRY_RUN", "").strip() == "1"
+
+    wr = WeReadClient(weread_cookie)
+    rw = ReadwiseClient(readwise_token)
+
+    books = wr.bookshelf(user_vid)
+    if not books:
+        print("No books found on bookshelf.")
+        return
+
+    all_highlights: List[RWHighlight] = []
+    for i, book in enumerate(books, 1):
+        try:
+            bm = wr.bookmarklist(book.book_id)
+            hs = _extract_highlights_from_bookmarklist(book, bm, only_recent_days_int)
+            all_highlights.extend(hs)
+
+            rv = wr.my_reviews(book.book_id)
+            ns = _extract_note_only_reviews(book, rv, only_recent_days_int)
+            all_highlights.extend(ns)
+
+            print(f"[{i}/{len(books)}] {book.title} -> highlights={len(hs)} notes={len(ns)}")
+        except Exception as e:
+            print(f"[{i}/{len(books)}] {book.title} -> ERROR: {e}")
+
+    # If huge, chunk to avoid request size issues
+    CHUNK = 200
+    print(f"Total to sync: {len(all_highlights)}")
+    if dry_run:
+        print("DRY_RUN=1, skipping Readwise post.")
+        return
+
+    sent = 0
+    for start in range(0, len(all_highlights), CHUNK):
+        chunk = all_highlights[start : start + CHUNK]
+        if not chunk:
+            continue
+        resp = rw.post_highlights(chunk)
+        sent += len(chunk)
+        print(f"Posted {sent}/{len(all_highlights)}. Readwise response keys={list(resp.keys())}")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("weread_cookie")
-    parser.add_argument("readwise_token")
-    options = parser.parse_args()
-    weread_cookie = options.weread_cookie
-    readwise_token = options.readwise_token
-    session = requests.Session()
-    session.cookies = parse_cookie_string(weread_cookie)
-    session.get(WEREAD_URL)
-    books = get_notebooklist()
-    
-    
-    #提取书籍和笔记的数量
-    querystring = {
-        'page_size':1000,
-        "category": "books",
-        "source":"weread_app",
-        
-    }
-    
-    response = requests.get(
-        url="https://readwise.io/api/v2/books/",
-        headers={"Authorization": f"Token {readwise_token}"},
-        params=querystring
-    )
-    
-    data = response.json()
-    readwise_book_num=data['count']
-    readwise_book = {book['title']:book['num_highlights'] for book in data['results']}
-    
-    
-    #开始导入
-    if (books != None):
-        for book in books[:]:
-            #无笔记跳过
-            if book.get("noteCount",0)+book.get("reviewCount",0)==0:
-                continue
-            sort = book["sort"]
-            book = book.get("book")
-            title = book.get("title").replace('/','').replace(':','')
-            cover = book.get("cover")
-            bookId = book.get("bookId")
-            author = book.get("author")
-            
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            #print(title,bookId)
-            
-            if title in readwise_book and len(bookmark_list)==readwise_book[title]:
-                print("跳过",title,bookId)
-                continue
-            else:
-                annotations = []
-                
-            
-            bookmark_list = sorted(bookmark_list, key=lambda x: (
-                x.get("chapterUid", 1), 0 if (x.get("range", "") == "" or x.get("range").split("-")[0]=="" ) else int(x.get("range").split("-")[0])))
-            
-                
-            for bookmark in bookmark_list:
-                time.sleep(0.3)
-                
-                params = {
-                    "text": bookmark['markText'],
-                    "title": title,
-                    "author": author,
-                    "source_type": "weread_app",
-                    "category": "books",
-                    # "location": bookmark['range'],
-                    # "location_type": ,
-                    'image_url':cover,
-                    'source_url':f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
-                    "highlighted_at": ctime2utc(bookmark['createTime']),#"2020-07-14T20:11:24+00:00",
-                    
-                }
-                if 	'note' in bookmark:
-                    params['note'] = bookmark.get('note')
-                    reviewId  =  bookmark.get('reviewId')
-                    params['highlight_url'] = f'https://weread.qq.com/review-detail?reviewid={reviewId}&type=1'
-                    
-                annotations.append(params)
-    
-            
-    
-           
-            resp = requests.post(
-                url="https://readwise.io/api/v2/highlights/",
-                headers={"Authorization": f"Token {readwise_token}"},
-                # headers={"Authorization": f"Token {readwise_token}"},
-                json={
-                    "highlights": annotations
-                }
-            )
-            # print(resp)
-            time.sleep(8)
+    main()
