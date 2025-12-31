@@ -22,7 +22,7 @@ jobs:
           pip install -r requirements.txt
       - name: Probe WeRead auth (notebooks)
         env:
-          WEREAD_COOKIE: ${{ secrets.WEREAD_C00KIE }}
+          WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
         run: |
           python - <<'PY'
           import os, requests
@@ -40,7 +40,7 @@ jobs:
           PY
       - name: Check cookie keys
         env:
-          COOKIE: ${{ secrets.WEREAD_C00KIE }}
+          COOKIE: ${{ secrets.WEREAD_COOKIE }}
         run: |
           python - <<'PY'
           import os, re
