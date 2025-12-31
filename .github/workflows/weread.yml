@@ -21,5 +21,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: weread sync
+        env:
+          WEREAD_COOKIE: ${{ secrets.WEREAD_COOKIE }}
+          READWISE_TOKEN: ${{ secrets.READWISE_TOKEN }}
         run: |
-          python weread.py "${{secrets.WEREAD_COOKIE}}" "${{secrets.READWISE_TOKEN}}"  
+          python weread.py
+
